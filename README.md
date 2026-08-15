@@ -50,6 +50,3 @@ This project maps land cover for **Chak No. 190 RB, Karari Kalan**, a village in
 
 
 
-## Author
-
-Your name here — internship/university project, 2026.
