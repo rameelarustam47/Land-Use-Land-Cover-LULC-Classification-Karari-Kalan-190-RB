@@ -1,0 +1,209 @@
+// ============================================
+// 'aoi' is your uploaded village boundary shapefile
+// ============================================
+
+Map.centerObject(aoi, 16);
+Map.setOptions('SATELLITE');
+
+var bands = ['B2', 'B3', 'B4', 'B8'];
+
+// Cloud Score+ masking
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterBounds(aoi)
+                  .filterDate('2025-01-01', '2026-08-14')
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                  .linkCollection(csPlus, ['cs'])
+                  .map(function(image) {
+                    return image.updateMask(image.select('cs').gte(0.6)).divide(10000);
+                  });
+
+var visualization = {
+  min: 0.0,
+  max: 0.3,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+var img = dataset.mean().clip(aoi);
+Map.addLayer(img, visualization, 'RGB');
+
+// Merge all training points
+var training_points = ResidentialArea.merge(Agriculture_Land)
+  .merge(BYpass)
+  .merge(Factory)
+  .merge(Graveyard)
+  .merge(Drainwater)
+  .merge(School)
+  .merge(Klin)
+  .merge(Water_Tank)
+  .merge(Pond);
+
+print('Training points count:', training_points.size());
+
+var training_data = img.select(bands).sampleRegions({
+  collection: training_points,
+  properties: ["LC"],
+  scale: 10,
+  tileScale: 16
+});
+
+print('Sample check size:', training_data.size());
+
+var withRandom = training_data.randomColumn('random', 42);
+var trainSet = withRandom.filter(ee.Filter.lt('random', 0.7));
+var testSet = withRandom.filter(ee.Filter.gte('random', 0.7));
+
+print('Training set size:', trainSet.size());
+print('Testing set size:', testSet.size());
+
+var classifier = ee.Classifier.smileCart();
+var trainedClassifier = classifier.train({
+  features: trainSet,
+  classProperty: "LC",
+  inputProperties: bands
+});
+
+var tested = testSet.classify(trainedClassifier);
+var confusionMatrix = tested.errorMatrix('LC', 'classification');
+
+print('Confusion Matrix:', confusionMatrix);
+print('Overall Accuracy:', confusionMatrix.accuracy());
+print('Kappa:', confusionMatrix.kappa());
+print('Producer Accuracy:', confusionMatrix.producersAccuracy());
+print('User Accuracy:', confusionMatrix.consumersAccuracy());
+
+var classified = img.select(bands).classify(trainedClassifier);
+var lulcPalette = [
+  '#dda0dd',  // 0 Residential - light purple/plum (buildings)
+  '#228b22',  // 1 Agriculture - forest green (crops/fields)
+  '#808080',  // 2 Bypass - grey (roads)
+  '#8b0000',  // 3 Factory - dark red (industrial)
+  '#a0522d',  // 4 Graveyard - brown (earth/graves)
+  '#00ced1',  // 5 Drainwater - turquoise (dirty water)
+  '#ff69b4',  // 6 School - pink (distinct, easy to spot)
+  '#ff8c00',  // 7 Klin - dark orange (kiln/fire association)
+  '#1e90ff',  // 8 Water Tank - blue (clean water)
+  '#000080'   // 9 Pond - navy blue (deeper/still water)
+];
+
+var classNames = ['Residential', 'Agriculture', 'Bypass', 'Factory', 'Graveyard', 'Drainwater', 'School', 'Klin', 'Water Tank', 'Pond'];
+
+
+Map.addLayer(classified, {
+  min: 0,
+  max: 9,
+  palette: lulcPalette
+}, 'Classified');
+
+var areaImage = ee.Image.pixelArea().addBands(classified);
+
+var areaStats = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: "LC"
+  }),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var classAreas = ee.List(areaStats.get('groups')).map(function(obj) {
+  obj = ee.Dictionary(obj);
+  return [obj.get('LC'), obj.get('sum')];
+});
+
+print('Class Areas (sq. meters):', classAreas);
+
+var chartData = ee.FeatureCollection(classAreas.map(function(arr) {
+  return ee.Feature(null, {
+    LC: ee.Number(ee.List(arr).get(0)),
+    Area: ee.Number(ee.List(arr).get(1)).divide(1e6)
+  });
+}));
+
+var chart = ui.Chart.feature.byFeature(chartData, "LC", "Area")
+  .setChartType("ColumnChart")
+  .setOptions({
+    title: "Land Cover Area Distribution (2025-2026)",
+    hAxis: {title: "Land Cover Class"},
+    vAxis: {title: "Area (sq. km)"},
+    colors: lulcPalette
+  });
+print(chart);
+
+var legend = ui.Panel({
+  style: {position: 'bottom-left', padding: '8px 15px'}
+});
+
+var legendTitle = ui.Label({
+  value: 'Karari Kalan 190 RB - LULC',
+  style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 6px 0', padding: '0'}
+});
+legend.add(legendTitle);
+
+function makeLegendRow(color, name) {
+  var colorBox = ui.Label({
+    style: {backgroundColor: color, padding: '8px', margin: '0 0 4px 0'}
+  });
+  var label = ui.Label({
+    value: name,
+    style: {margin: '0 0 4px 6px'}
+  });
+  return ui.Panel({
+    widgets: [colorBox, label],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+}
+
+for (var i = 0; i < lulcPalette.length; i++) {
+  legend.add(makeLegendRow(lulcPalette[i], classNames[i]));
+}
+Map.add(legend);
+
+Export.image.toDrive({
+  image: classified,
+  description: 'LandCoverClassification_2025_2026',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'land_cover_classification_2025_2026',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13,
+  crs: 'EPSG:4326'
+});
+// ============================================
+// Swipe comparison: satellite image vs classified map
+// ============================================
+var leftMap = ui.Map();
+var rightMap = ui.Map();
+
+leftMap.setOptions('SATELLITE');
+rightMap.setOptions('SATELLITE');
+
+var linker = ui.Map.Linker([leftMap, rightMap]);
+
+leftMap.addLayer(img, visualization, 'Satellite RGB');
+leftMap.centerObject(aoi, 16);
+
+rightMap.addLayer(classified, {min: 0, max: 9, palette: lulcPalette}, 'Classified LULC');
+rightMap.centerObject(aoi, 16);
+
+var leftLabel = ui.Label('Real Satellite Image', {
+  position: 'top-left', padding: '8px', fontWeight: 'bold', backgroundColor: 'white'
+});
+var rightLabel = ui.Label('Land Cover Classification', {
+  position: 'top-left', padding: '8px', fontWeight: 'bold', backgroundColor: 'white'
+});
+leftMap.add(leftLabel);
+rightMap.add(rightLabel);
+
+var splitPanel = ui.SplitPanel({
+  firstPanel: leftMap,
+  secondPanel: rightMap,
+  orientation: 'horizontal',
+  wipe: true,
+  style: {stretch: 'both'}
+});
+
+ui.root.clear();
+ui.root.add(splitPanel);
